@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>PPR Mobilā Kamera</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+  <!-- WSS Klienta bibliotēka -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.5/mqtt.min.js"></script>
 </head>
 <body class="h-full flex flex-col justify-between p-4 selection:bg-indigo-500/20 antialiased font-sans">
 
@@ -32,7 +33,7 @@
     </div>
     <div class="space-y-1.5 px-4">
       <h2 class="text-lg font-bold text-slate-100">Fotografējiet pavadzīmi</h2>
-      <p class="text-xs text-slate-400 leading-relaxed max-w-[280px]">Fotoattēli šifrētā kanālā nonāk datora rindā. Kad visas lapas uzņemtas, datorā nospiediet «Sākt apstrādi».</p>
+      <p class="text-xs text-slate-400 leading-relaxed max-w-[280px]">Fotoattēli uzreiz nonāk kases datora rindā. Kad visas lapas uzņemtas, datorā nospiediet «Sākt apstrādi».</p>
     </div>
 
     <!-- Nosūtīto bilžu skaitītājs -->
@@ -53,27 +54,11 @@
   </footer>
 
   <script>
-    let peer = null;
-    let conn = null;
+    let client = null;
     let targetRoom = '';
     let sentCounter = 0;
-
-    // STUN un TURN releju klasteris drošam 4G/5G savienojumam caur HTTPS 443 portu
-    const RTC_CONFIG = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        {
-          urls: [
-            'turn:openrelay.metered.ca:80',
-            'turn:openrelay.metered.ca:443',
-            'turn:openrelay.metered.ca:443?transport=tcp'
-          ],
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        }
-      ]
-    };
+    let isConnectedToDesktop = false;
+    let pingInterval = null;
 
     function getRoomFromUrl() {
       const hash = window.location.hash || '';
@@ -100,79 +85,106 @@
       }
     }
 
-    function initClientPeer() {
+    function initClientMqtt() {
       targetRoom = getRoomFromUrl();
       const roomText = document.getElementById('targetRoomText');
       if (roomText) roomText.innerText = targetRoom ? `Istaba: ${targetRoom}` : 'Nav koda!';
 
       if (!targetRoom) {
         setStatus(false, 'Nav koda');
-        alert('Lūdzu, atveriet saiti ar istabas parametru (piem., #room=ppr-vilani) vai noskenējiet QR kodu!');
+        alert('Lūdzu, atveriet saiti ar istabas kodu (piem., #room=ppr-vilani) vai noskenējiet QR kodu!');
         return;
       }
 
-      if (peer && !peer.destroyed) {
-        try { peer.destroy(); } catch (e) {}
+      if (client) {
+        try { client.end(true); } catch (e) {}
+        client = null;
       }
 
-      peer = new Peer({
-        debug: 1,
-        config: RTC_CONFIG
-      });
+      setStatus(false, 'Savienojas...');
 
-      peer.on('open', () => {
-        connectToDesktop();
-      });
+      const primaryBroker = 'wss://broker.hivemq.com:8884/mqtt';
+      const fallbackBroker = 'wss://broker.emqx.io:8084/mqtt';
+      const clientId = 'ppr_cam_' + Math.random().toString(36).substring(2, 9);
+      let isFallback = false;
 
-      peer.on('error', (err) => {
-        if (conn && conn.open) return;
-        if (['network', 'lost-connection', 'socket-error', 'socket-closed'].includes(err.type)) {
-          setStatus(false, 'Atjauno saikni...');
-          setTimeout(connectToDesktop, 1500);
-          return;
-        }
-        console.warn('Peer error:', err);
-      });
+      function connect(brokerUrl) {
+        const c = mqtt.connect(brokerUrl, {
+          clientId: clientId,
+          clean: true,
+          connectTimeout: 5000,
+          reconnectPeriod: 2500
+        });
+
+        c.on('connect', () => {
+          const pongTopic = `ppr2026/${targetRoom}/pong`;
+          const ackTopic = `ppr2026/${targetRoom}/ack`;
+
+          c.subscribe([pongTopic, ackTopic], (err) => {
+            if (!err) {
+              sendPing();
+              clearInterval(pingInterval);
+              pingInterval = setInterval(sendPing, 3000);
+            }
+          });
+        });
+
+        c.on('message', (topic, message) => {
+          try {
+            // Dators ir atbildējis
+            if (topic.endsWith('/pong')) {
+              isConnectedToDesktop = true;
+              setStatus(true, '✓ Savienots');
+            }
+
+            // Dators apstiprinājis bildes saņemšanu
+            if (topic.endsWith('/ack')) {
+              sentCounter++;
+              document.getElementById('sentCount').innerText = sentCounter;
+              setStatus(true, '✓ Savienots');
+              if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+            }
+          } catch (e) {}
+        });
+
+        c.on('error', (err) => {
+          console.warn('[PPR Cam] Kļūda:', err);
+          if (!isFallback) {
+            isFallback = true;
+            try { c.end(true); } catch (e) {}
+            connect(fallbackBroker);
+          }
+        });
+
+        c.on('close', () => {
+          isConnectedToDesktop = false;
+          setStatus(false, 'Meklē datoru...');
+        });
+
+        return c;
+      }
+
+      client = connect(primaryBroker);
     }
 
-    function connectToDesktop() {
-      if (!peer || peer.destroyed) return;
-
-      conn = peer.connect(targetRoom, {
-        reliable: true
-      });
-
-      conn.on('open', () => {
-        setStatus(true, '✓ Savienots');
-        if (navigator.vibrate) navigator.vibrate(80);
-      });
-
-      conn.on('data', (data) => {
-        if (data && data.type === 'PPR_ACK') {
-          sentCounter++;
-          document.getElementById('sentCount').innerText = sentCounter;
-          setStatus(true, '✓ Savienots');
-          if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
-        }
-      });
-
-      conn.on('close', () => {
-        setStatus(false, 'Savienojas...');
-        setTimeout(connectToDesktop, 2000);
-      });
+    function sendPing() {
+      if (client && client.connected) {
+        client.publish(`ppr2026/${targetRoom}/ping`, JSON.stringify({ ping: true, time: Date.now() }));
+      }
     }
 
     function triggerCamera() {
       document.getElementById('cameraInput').click();
     }
 
+    // Saspiež foto līdz optimālajiem 2048px (180-350 KB) acumirklīgai aizsūtīšanai
     function compressMobileImage(file) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (e) => {
           const img = new Image();
           img.onload = () => {
-            const MAX_DIM = 2560;
+            const MAX_DIM = 2048;
             let w = img.width;
             let h = img.height;
             if (w > MAX_DIM || h > MAX_DIM) {
@@ -189,7 +201,7 @@
             canvas.height = h;
             const ctx = canvas.getContext('2d');
             ctx.drawImage(img, 0, 0, w, h);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.80);
             resolve(dataUrl.split(',')[1]);
           };
           img.onerror = () => reject(new Error('Neizdevās nolasīt attēlu'));
@@ -214,20 +226,22 @@
       try {
         const base64Data = await compressMobileImage(file);
 
-        if (conn && conn.open) {
-          conn.send({
-            type: 'PPR_IMAGE',
+        if (client && client.connected) {
+          const payload = JSON.stringify({
             name: file.name || `foto_${Date.now()}.jpg`,
-            data: base64Data
+            data: base64Data,
+            timestamp: Date.now()
           });
+
+          client.publish(`ppr2026/${targetRoom}/image`, payload, { qos: 0 });
           btnText.innerText = "✓ Nosūtīts!";
           setStatus(true, '✓ Savienots');
         } else {
-          throw new Error('Dators nav sasniedzams. Pārbaudiet savienojumu.');
+          throw new Error('Nav sakaru ar kases datoru.');
         }
       } catch (err) {
-        alert('Kļūda: ' + err.message);
-        setStatus(false, 'Mēģina vēlreiz...');
+        alert('Kļūda nosūtot: ' + err.message);
+        setStatus(false, 'Meklē datoru...');
       } finally {
         setTimeout(() => {
           btn.disabled = false;
@@ -239,7 +253,14 @@
       e.target.value = '';
     });
 
-    window.addEventListener('DOMContentLoaded', initClientPeer);
+    // Kad lietotājs atgriežas no telefona kameras, nekavējoties atjauno pārbaudi
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        sendPing();
+      }
+    });
+
+    window.addEventListener('DOMContentLoaded', initClientMqtt);
   </script>
 </body>
 </html>
