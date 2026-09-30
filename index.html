@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>PPR Mobilā Kamera</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- WSS Klienta bibliotēka -->
+  <!-- Hibrīda klienti: PeerJS (Lokālais Wi-Fi) + MQTT WSS (Mobilais 4G/GSM) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.5/mqtt.min.js"></script>
 </head>
 <body class="h-full flex flex-col justify-between p-4 selection:bg-indigo-500/20 antialiased font-sans">
@@ -54,10 +55,15 @@
   </footer>
 
   <script>
-    let client = null;
     let targetRoom = '';
     let sentCounter = 0;
-    let isConnectedToDesktop = false;
+
+    // Wi-Fi P2P mainīgie
+    let p2pPeer = null;
+    let p2pConn = null;
+
+    // GSM WSS mainīgie
+    let mqttClient = null;
     let pingInterval = null;
 
     function getRoomFromUrl() {
@@ -85,23 +91,69 @@
       }
     }
 
-    function initClientMqtt() {
+    function initHybridClient() {
       targetRoom = getRoomFromUrl();
       const roomText = document.getElementById('targetRoomText');
       if (roomText) roomText.innerText = targetRoom ? `Istaba: ${targetRoom}` : 'Nav koda!';
 
       if (!targetRoom) {
         setStatus(false, 'Nav koda');
-        alert('Lūdzu, atveriet saiti ar istabas kodu (piem., #room=ppr-vilani) vai noskenējiet QR kodu!');
+        alert('Lūdzu, atveriet saiti ar veikala kodu (piem., #room=ppr-vilani) vai noskenējiet QR kodu!');
         return;
       }
 
-      if (client) {
-        try { client.end(true); } catch (e) {}
-        client = null;
+      setStatus(false, 'Savienojas...');
+
+      // 1. Mēģinām lokālo Wi-Fi P2P (PeerJS)
+      initLocalP2PClient();
+
+      // 2. Vienlaikus pieslēdzam GSM WSS (MQTT) kā nepārtrauktu drošības kanālu
+      initGsmMqttClient();
+    }
+
+    function initLocalP2PClient() {
+      if (p2pPeer && !p2pPeer.destroyed) {
+        try { p2pPeer.destroy(); } catch (e) {}
       }
 
-      setStatus(false, 'Savienojas...');
+      p2pPeer = new Peer({ debug: 1 });
+
+      p2pPeer.on('open', () => {
+        connectP2P();
+      });
+
+      p2pPeer.on('error', () => {
+        // Klusi ignorējam, ja esam 4G tīklā, jo paralēli strādā GSM MQTT
+      });
+    }
+
+    function connectP2P() {
+      if (!p2pPeer || p2pPeer.destroyed) return;
+      p2pConn = p2pPeer.connect(targetRoom, { reliable: true });
+
+      p2pConn.on('open', () => {
+        setStatus(true, '✓ Savienots (Wi-Fi lokāli)');
+      });
+
+      p2pConn.on('data', (data) => {
+        if (data && data.type === 'PPR_ACK') {
+          sentCounter++;
+          document.getElementById('sentCount').innerText = sentCounter;
+          setStatus(true, '✓ Savienots (Wi-Fi lokāli)');
+          if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+        }
+      });
+
+      p2pConn.on('close', () => {
+        p2pConn = null;
+        checkCurrentStatus();
+      });
+    }
+
+    function initGsmMqttClient() {
+      if (mqttClient) {
+        try { mqttClient.end(true); } catch (e) {}
+      }
 
       const primaryBroker = 'wss://broker.hivemq.com:8884/mqtt';
       const fallbackBroker = 'wss://broker.emqx.io:8084/mqtt';
@@ -112,7 +164,7 @@
         const c = mqtt.connect(brokerUrl, {
           clientId: clientId,
           clean: true,
-          connectTimeout: 5000,
+          connectTimeout: 6000,
           reconnectPeriod: 2500
         });
 
@@ -122,33 +174,29 @@
 
           c.subscribe([pongTopic, ackTopic], (err) => {
             if (!err) {
-              sendPing();
+              sendMqttPing();
               clearInterval(pingInterval);
-              pingInterval = setInterval(sendPing, 3000);
+              pingInterval = setInterval(sendMqttPing, 3500);
             }
           });
         });
 
-        c.on('message', (topic, message) => {
-          try {
-            // Dators ir atbildējis
-            if (topic.endsWith('/pong')) {
-              isConnectedToDesktop = true;
-              setStatus(true, '✓ Savienots');
+        c.on('message', (topic) => {
+          if (topic.endsWith('/pong')) {
+            if (!p2pConn || !p2pConn.open) {
+              setStatus(true, '✓ Savienots (GSM 4G)');
             }
+          }
 
-            // Dators apstiprinājis bildes saņemšanu
-            if (topic.endsWith('/ack')) {
-              sentCounter++;
-              document.getElementById('sentCount').innerText = sentCounter;
-              setStatus(true, '✓ Savienots');
-              if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
-            }
-          } catch (e) {}
+          if (topic.endsWith('/ack')) {
+            sentCounter++;
+            document.getElementById('sentCount').innerText = sentCounter;
+            checkCurrentStatus();
+            if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+          }
         });
 
-        c.on('error', (err) => {
-          console.warn('[PPR Cam] Kļūda:', err);
+        c.on('error', () => {
           if (!isFallback) {
             isFallback = true;
             try { c.end(true); } catch (e) {}
@@ -157,19 +205,28 @@
         });
 
         c.on('close', () => {
-          isConnectedToDesktop = false;
-          setStatus(false, 'Meklē datoru...');
+          checkCurrentStatus();
         });
 
         return c;
       }
 
-      client = connect(primaryBroker);
+      mqttClient = connect(primaryBroker);
     }
 
-    function sendPing() {
-      if (client && client.connected) {
-        client.publish(`ppr2026/${targetRoom}/ping`, JSON.stringify({ ping: true, time: Date.now() }));
+    function sendMqttPing() {
+      if (mqttClient && mqttClient.connected) {
+        mqttClient.publish(`ppr2026/${targetRoom}/ping`, JSON.stringify({ ping: true, time: Date.now() }));
+      }
+    }
+
+    function checkCurrentStatus() {
+      if (p2pConn && p2pConn.open) {
+        setStatus(true, '✓ Savienots (Wi-Fi lokāli)');
+      } else if (mqttClient && mqttClient.connected) {
+        setStatus(true, '✓ Savienots (GSM 4G)');
+      } else {
+        setStatus(false, 'Savienojas...');
       }
     }
 
@@ -177,14 +234,13 @@
       document.getElementById('cameraInput').click();
     }
 
-    // Saspiež foto līdz optimālajiem 2048px (180-350 KB) acumirklīgai aizsūtīšanai
     function compressMobileImage(file) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (e) => {
           const img = new Image();
           img.onload = () => {
-            const MAX_DIM = 2048;
+            const MAX_DIM = 2200;
             let w = img.width;
             let h = img.height;
             if (w > MAX_DIM || h > MAX_DIM) {
@@ -201,15 +257,68 @@
             canvas.height = h;
             const ctx = canvas.getContext('2d');
             ctx.drawImage(img, 0, 0, w, h);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.80);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
             resolve(dataUrl.split(',')[1]);
           };
-          img.onerror = () => reject(new Error('Neizdevās nolasīt attēlu'));
+          img.onerror = () => reject(new Error('Neizdevās nolasīt fotoattēlu'));
           img.src = e.target.result;
         };
         reader.onerror = () => reject(new Error('Faila lasīšanas kļūda'));
         reader.readAsDataURL(file);
       });
+    }
+
+    // Pārliecinās, ka sakari ir aktīvi pirms nosūtīšanas
+    function ensureReadyConnection(timeoutMs = 7000) {
+      return new Promise((resolve, reject) => {
+        if ((p2pConn && p2pConn.open) || (mqttClient && mqttClient.connected)) {
+          return resolve();
+        }
+
+        if (mqttClient) {
+          try { mqttClient.reconnect(); } catch (e) {}
+        }
+        sendMqttPing();
+
+        const start = Date.now();
+        const t = setInterval(() => {
+          if ((p2pConn && p2pConn.open) || (mqttClient && mqttClient.connected)) {
+            clearInterval(t);
+            return resolve();
+          }
+          if (Date.now() - start > timeoutMs) {
+            clearInterval(t);
+            reject(new Error("Neizdevās atjaunot savienojumu ar datoru. Pārbaudiet tīklu!"));
+          }
+        }, 150);
+      });
+    }
+
+    async function sendImageViaGsmChunks(fileName, base64Data, onProgress) {
+      const CHUNK_SIZE = 55 * 1024; // 55 KB
+      const totalChunks = Math.ceil(base64Data.length / CHUNK_SIZE);
+      const transferId = 'tr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, base64Data.length);
+        const chunkStr = base64Data.substring(start, end);
+
+        const payload = JSON.stringify({
+          id: transferId,
+          name: fileName || `foto_${Date.now()}.jpg`,
+          idx: i,
+          total: totalChunks,
+          chunk: chunkStr
+        });
+
+        mqttClient.publish(`ppr2026/${targetRoom}/chunk`, payload, { qos: 0 });
+        if (onProgress) onProgress(i + 1, totalChunks);
+
+        if (i < totalChunks - 1) {
+          await new Promise(r => setTimeout(r, 35));
+        }
+      }
     }
 
     document.getElementById('cameraInput').addEventListener('change', async (e) => {
@@ -221,46 +330,59 @@
       const btnText = document.getElementById('shutterBtnText');
 
       btn.disabled = true;
-      btnText.innerText = "Sūta uz datoru...";
+      btnText.innerText = "Apstrādā fotoattēlu...";
 
       try {
         const base64Data = await compressMobileImage(file);
 
-        if (client && client.connected) {
-          const payload = JSON.stringify({
-            name: file.name || `foto_${Date.now()}.jpg`,
-            data: base64Data,
-            timestamp: Date.now()
-          });
+        btnText.innerText = "Pārbauda savienojumu...";
+        await ensureReadyConnection(7000);
 
-          client.publish(`ppr2026/${targetRoom}/image`, payload, { qos: 0 });
-          btnText.innerText = "✓ Nosūtīts!";
-          setStatus(true, '✓ Savienots');
+        // 1. Izvēle: Ja aktīvs Wi-Fi P2P, sūtam pa tiešo caur lokālo tīklu
+        if (p2pConn && p2pConn.open) {
+          btnText.innerText = "Sūta pa lokālo Wi-Fi...";
+          p2pConn.send({
+            type: 'PPR_IMAGE',
+            name: file.name || `foto_${Date.now()}.jpg`,
+            data: base64Data
+          });
+        } 
+        // 2. Izvēle: Ja esam 4G/GSM tīklā, sūtam pa drošajiem WSS gabaliņiem
+        else if (mqttClient && mqttClient.connected) {
+          btnText.innerText = "Sūta pa GSM tīklu...";
+          await sendImageViaGsmChunks(file.name, base64Data, (sent, total) => {
+            btnText.innerText = `Sūta GSM (${sent}/${total})...`;
+          });
         } else {
-          throw new Error('Nav sakaru ar kases datoru.');
+          throw new Error("Nav savienojuma ar kases datoru!");
         }
+
+        btnText.innerText = "✓ Nosūtīts!";
+        checkCurrentStatus();
       } catch (err) {
+        console.error(err);
         alert('Kļūda nosūtot: ' + err.message);
-        setStatus(false, 'Meklē datoru...');
+        checkCurrentStatus();
       } finally {
         setTimeout(() => {
           btn.disabled = false;
           btnText.innerText = "Uzņemt nākamo foto";
-          setStatus(true, '✓ Savienots');
-        }, 1200);
+          checkCurrentStatus();
+        }, 1400);
+        e.target.value = '';
       }
-
-      e.target.value = '';
     });
 
-    // Kad lietotājs atgriežas no telefona kameras, nekavējoties atjauno pārbaudi
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
-        sendPing();
+        sendMqttPing();
+        if (!p2pConn || !p2pConn.open) {
+          connectP2P();
+        }
       }
     });
 
-    window.addEventListener('DOMContentLoaded', initClientMqtt);
+    window.addEventListener('DOMContentLoaded', initHybridClient);
   </script>
 </body>
 </html>
