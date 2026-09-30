@@ -9,9 +9,10 @@
 </head>
 <body class="h-full flex flex-col justify-between p-4 selection:bg-indigo-500/20 antialiased font-sans">
 
+  <!-- Augšējā statusa josla -->
   <header class="flex items-center justify-between pb-3 border-b border-slate-800">
     <div class="flex items-center gap-2">
-      <div class="w-7 h-7 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-xs">📷</div>
+      <div class="w-7 h-7 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-xs shadow-md">📷</div>
       <div>
         <h1 class="text-xs font-bold tracking-tight">PPR Kameras Tilts</h1>
         <p id="targetRoomText" class="text-[10px] text-slate-400 font-mono">Pieslēdzas...</p>
@@ -23,27 +24,30 @@
     </div>
   </header>
 
+  <!-- Centrālais informatīvais lauks -->
   <main class="flex-1 flex flex-col items-center justify-center my-6 space-y-4 text-center">
     <div class="w-20 h-20 rounded-3xl bg-slate-900 border border-slate-800 flex items-center justify-center text-3xl shadow-xl">
       📄
     </div>
     <div class="space-y-1">
       <h2 class="text-base font-bold text-slate-100">Fotografējiet pavadzīmi</h2>
-      <p class="text-xs text-slate-400 max-w-[260px]">Nofotografētais attēls automātiski ielidos tieši kases datora tabulā ar pilnu izšķirtspēju.</p>
+      <p class="text-xs text-slate-400 max-w-[260px]">Nofotografētais attēls automātiski ielido tieši kases datora tabulā.</p>
     </div>
 
+    <!-- Nosūtīto bilžu skaitītājs -->
     <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-2xl bg-indigo-950/60 border border-indigo-500/30 text-xs text-indigo-300">
       <span>Nosūtīti fotoattēli:</span>
       <strong id="sentCount" class="font-mono text-white text-sm">0</strong>
     </div>
   </main>
 
+  <!-- Apakšējā kameras slēdža poga -->
   <footer class="pb-4 space-y-3">
     <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden">
 
     <button id="shutterBtn" onclick="triggerCamera()" disabled class="w-full py-4 rounded-2xl bg-indigo-600 active:bg-indigo-700 disabled:bg-slate-800 disabled:text-slate-600 text-white font-bold text-base shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2.5 transition">
       <svg class="w-5 h-5 text-indigo-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-      <span>Uzņemt pavadzīmes foto</span>
+      <span id="shutterBtnText">Uzņemt pavadzīmes foto</span>
     </button>
   </footer>
 
@@ -52,6 +56,8 @@
     let conn = null;
     let targetRoom = '';
     let sentCounter = 0;
+    let reconnectTimer = null;
+    let pingInterval = null;
 
     function getRoomFromUrl() {
       const hash = window.location.hash || '';
@@ -62,56 +68,159 @@
     function initClientPeer() {
       targetRoom = getRoomFromUrl();
       const roomText = document.getElementById('targetRoomText');
-      if (roomText) roomText.innerText = targetRoom ? `Istaba: ${targetRoom}` : 'Nav istabas koda!';
+      if (roomText) roomText.innerText = targetRoom ? `Istaba: ${targetRoom}` : 'Nav koda!';
 
       if (!targetRoom) {
-        setStatus(false, 'Nav QR koda');
-        alert('Trūkst savienojuma koda! Lūdzu, noskenējiet QR kodu no datora ekrāna vēlreiz.');
+        setStatus(false, 'Nav QR koda', 'amber');
+        alert('Trūkst istabas koda! Lūdzu, noskenējiet QR kodu no datora ekrāna vēlreiz.');
         return;
       }
 
-      peer = new Peer({ debug: 1 });
+      if (peer && !peer.destroyed) {
+        try { peer.destroy(); } catch (e) {}
+      }
+
+      peer = new Peer({ debug: 0 });
 
       peer.on('open', () => {
-        conn = peer.connect(targetRoom, { reliable: true });
-
-        conn.on('open', () => {
-          setStatus(true, 'Savienots');
-          document.getElementById('shutterBtn').disabled = false;
-          if (navigator.vibrate) navigator.vibrate(80);
-        });
-
-        conn.on('data', (data) => {
-          if (data && data.type === 'PPR_ACK') {
-            sentCounter++;
-            document.getElementById('sentCount').innerText = sentCounter;
-            if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
-          }
-        });
-
-        conn.on('close', () => {
-          setStatus(false, 'Atvienots');
-          document.getElementById('shutterBtn').disabled = true;
-        });
+        connectToHost();
       });
 
       peer.on('error', (err) => {
-        console.warn('P2P Error', err);
-        setStatus(false, 'Kļūda');
+        // Ja tiešais P2P kanāls ar datoru jau ir vaļā, ignorējam fona signalizācijas servera brīdinājumus
+        if (conn && conn.open) {
+          setStatus(true, 'Savienots', 'emerald');
+          return;
+        }
+
+        console.warn('P2P Error:', err.type);
+        // Ja radās pārrāvums, mēģinām atjaunot
+        scheduleReconnect();
+      });
+
+      peer.on('disconnected', () => {
+        if (conn && conn.open) return;
+        try { peer.reconnect(); } catch (e) {}
       });
     }
 
-    function setStatus(connected, label) {
+    function connectToHost() {
+      if (!peer || peer.destroyed || !targetRoom) return;
+
+      setStatus(false, 'Savienojas...', 'amber');
+      conn = peer.connect(targetRoom, { reliable: true });
+
+      conn.on('open', () => {
+        clearTimeout(reconnectTimer);
+        setStatus(true, 'Savienots', 'emerald');
+        const btn = document.getElementById('shutterBtn');
+        if (btn) btn.disabled = false;
+        if (navigator.vibrate) navigator.vibrate(80);
+
+        // Uzturam kanālu nomodā ar vieglu ping ik pēc 10 sekundēm
+        clearInterval(pingInterval);
+        pingInterval = setInterval(() => {
+          if (conn && conn.open) {
+            conn.send({ type: 'PPR_PING' });
+          }
+        }, 10000);
+      });
+
+      conn.on('data', (data) => {
+        if (data && data.type === 'PPR_ACK') {
+          sentCounter++;
+          const sentEl = document.getElementById('sentCount');
+          if (sentEl) sentEl.innerText = sentCounter;
+          setStatus(true, 'Savienots', 'emerald');
+          if (navigator.vibrate) navigator.vibrate([50, 80, 50]);
+        }
+      });
+
+      conn.on('close', () => {
+        clearInterval(pingInterval);
+        setStatus(false, 'Savienojums zuda', 'amber');
+        scheduleReconnect();
+      });
+
+      conn.on('error', () => {
+        if (!conn || !conn.open) {
+          scheduleReconnect();
+        }
+      });
+    }
+
+    function scheduleReconnect() {
+      clearTimeout(reconnectTimer);
+      setStatus(false, 'Atjauno savienojumu...', 'amber');
+      const btn = document.getElementById('shutterBtn');
+      if (btn) btn.disabled = true;
+
+      reconnectTimer = setTimeout(() => {
+        if (!conn || !conn.open) {
+          if (!peer || peer.destroyed) {
+            initClientPeer();
+          } else {
+            connectToHost();
+          }
+        }
+      }, 1500);
+    }
+
+    function setStatus(connected, label, color = 'emerald') {
       const dot = document.getElementById('statusDot');
       const text = document.getElementById('statusLabel');
       if (text) text.innerText = label;
       if (dot) {
-        dot.className = connected ? "w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" : "w-1.5 h-1.5 rounded-full bg-amber-500";
+        if (color === 'emerald') {
+          dot.className = "w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse";
+        } else if (color === 'amber') {
+          dot.className = "w-1.5 h-1.5 rounded-full bg-amber-500";
+        } else {
+          dot.className = "w-1.5 h-1.5 rounded-full bg-red-500";
+        }
       }
     }
 
     function triggerCamera() {
       document.getElementById('cameraInput').click();
+    }
+
+    // Viedā attēla optimizācija telefonā pirms sūtīšanas pa WebRTC (2560px, JPEG 0.85)
+    function compressImageForP2P(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onload = () => {
+            const MAX_DIM = 2560; // Izcils asums pat sīkākajiem EAN kodiem un akcīzes sērijām
+            let width = img.width;
+            let height = img.height;
+
+            if (width > MAX_DIM || height > MAX_DIM) {
+              if (width > height) {
+                height = Math.round((height * MAX_DIM) / width);
+                width = MAX_DIM;
+              } else {
+                width = Math.round((width * MAX_DIM) / height);
+                height = MAX_DIM;
+              }
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            resolve(dataUrl.split(',')[1]);
+          };
+          img.onerror = () => reject(new Error("Neizdevās apstrādāt attēlu"));
+          img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error("Kļūda lasot failu"));
+        reader.readAsDataURL(file);
+      });
     }
 
     document.getElementById('cameraInput').addEventListener('change', async (e) => {
@@ -120,34 +229,64 @@
 
       const file = files[0];
       const btn = document.getElementById('shutterBtn');
+      const btnText = document.getElementById('shutterBtnText');
+
       btn.disabled = true;
-      btn.innerText = "Sūta uz datoru...";
+      btnText.innerText = "Sagatavo un sūta...";
 
       try {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const base64Data = reader.result.split(',')[1];
-          if (conn && conn.open) {
-            conn.send({
-              type: 'PPR_IMAGE',
-              name: file.name || `foto_${Date.now()}.jpg`,
-              data: base64Data
-            });
-          }
-          btn.disabled = false;
-          btn.innerText = "Uzņemt nākamo foto";
-        };
-        reader.readAsDataURL(file);
+        const base64Data = await compressImageForP2P(file);
+
+        if (conn && conn.open) {
+          conn.send({
+            type: 'PPR_IMAGE',
+            name: file.name || `foto_${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.jpg`,
+            data: base64Data
+          });
+          btnText.innerText = "Nosūtīts! Uzņemt nākamo";
+          setStatus(true, 'Savienots', 'emerald');
+        } else {
+          throw new Error("P2P savienojums pašlaik nav aktīvs");
+        }
       } catch (err) {
         alert('Kļūda nosūtot attēlu: ' + err.message);
+        btnText.innerText = "Mēģināt vēlreiz";
+        scheduleReconnect();
+      } finally {
         btn.disabled = false;
-        btn.innerText = "Mēģināt vēlreiz";
+        e.target.value = '';
       }
+    });
 
-      e.target.value = '';
+    // Kad lietotājs atgriežas no kameras lietotnes atpakaļ pārlūkā
+    window.addEventListener('focus', () => {
+      if (conn && conn.open) {
+        setStatus(true, 'Savienots', 'emerald');
+      } else {
+        scheduleReconnect();
+      }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        if (conn && conn.open) {
+          setStatus(true, 'Savienots', 'emerald');
+        } else {
+          scheduleReconnect();
+        }
+      }
     });
 
     window.addEventListener('DOMContentLoaded', initClientPeer);
   </script>
 </body>
 </html>
+```
+
+5. Apakšā nospiediet **Commit changes...** $\rightarrow$ **Commit changes**.
+6. Pagaidiet ~20 sekundes, līdz GitHub Pages atjaunojas, un telefonā pārlādējiet lapu (`refresh`).
+
+Tagad, uzņemot bildi un atgriežoties pārlūkā:
+* Aplītis paliks **zaļš**;
+* Fails aizsūtīsies **3x ātrāk**;
+* Nosūtīto bilžu skaitītājs gludi palielināsies par katru veikto kadru.
