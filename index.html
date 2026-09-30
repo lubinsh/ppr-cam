@@ -32,7 +32,7 @@
     </div>
     <div class="space-y-1.5 px-4">
       <h2 class="text-lg font-bold text-slate-100">Fotografējiet pavadzīmi</h2>
-      <p class="text-xs text-slate-400 leading-relaxed max-w-[280px]">Fotoattēli šifrētā kanālā nonāk datora rindā. Kad visas lapas uzņemtas, datorā nospiediet Sākt apstrādi.</p>
+      <p class="text-xs text-slate-400 leading-relaxed max-w-[280px]">Fotoattēli šifrētā kanālā nonāk datora rindā. Kad visas lapas uzņemtas, datorā nospiediet «Sākt apstrādi».</p>
     </div>
 
     <!-- Nosūtīto bilžu skaitītājs -->
@@ -57,6 +57,16 @@
     let conn = null;
     let targetRoom = '';
     let sentCounter = 0;
+
+    const RTC_CONFIG = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+      ]
+    };
 
     function getRoomFromUrl() {
       const hash = window.location.hash || '';
@@ -90,7 +100,7 @@
 
       if (!targetRoom) {
         setStatus(false, 'Nav koda');
-        alert('Lūdzu, noskenējiet QR kodu no datora ekrāna vēlreiz!');
+        alert('Lūdzu, atveriet saiti ar istabas parametru (piem., #room=ppr-vilani) vai noskenējiet QR kodu!');
         return;
       }
 
@@ -98,26 +108,22 @@
         try { peer.destroy(); } catch (e) {}
       }
 
-      peer = new Peer({ debug: 1 });
+      peer = new Peer({
+        debug: 1,
+        config: RTC_CONFIG
+      });
 
       peer.on('open', () => {
         connectToDesktop();
       });
 
       peer.on('error', (err) => {
-        // AIZSARDZĪBA: Ja P2P kanāls ar datoru jau ir vaļā un strādā, ignorējam brokera brīdinājumus!
-        if (conn && conn.open) {
-          console.log('Ignorēts fona brīdinājums, jo P2P ir aktīvs:', err.type);
-          return;
-        }
-
-        // Ja tas ir tikai fona savienojuma pārrāvums kameras dēļ, neuztraucam lietotāju ar "Kļūda"
+        if (conn && conn.open) return;
         if (['network', 'lost-connection', 'socket-error', 'socket-closed'].includes(err.type)) {
           setStatus(false, 'Atjauno saikni...');
-          setTimeout(connectToDesktop, 1200);
+          setTimeout(connectToDesktop, 1500);
           return;
         }
-
         console.warn('Peer error:', err);
       });
     }
@@ -125,7 +131,9 @@
     function connectToDesktop() {
       if (!peer || peer.destroyed) return;
 
-      conn = peer.connect(targetRoom, { reliable: true });
+      conn = peer.connect(targetRoom, {
+        reliable: true
+      });
 
       conn.on('open', () => {
         setStatus(true, '✓ Savienots');
@@ -143,11 +151,7 @@
 
       conn.on('close', () => {
         setStatus(false, 'Savienojas...');
-        setTimeout(connectToDesktop, 1500);
-      });
-
-      conn.on('error', (err) => {
-        console.warn('Conn error', err);
+        setTimeout(connectToDesktop, 2000);
       });
     }
 
@@ -155,14 +159,13 @@
       document.getElementById('cameraInput').click();
     }
 
-    // Zibenīga attēla samazināšana telefonā, lai WebRTC nepārpildītu buferi
     function compressMobileImage(file) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (e) => {
           const img = new Image();
           img.onload = () => {
-            const MAX_DIM = 2560; // Optimālā izšķirtspēja precīzam EAN un tekstam
+            const MAX_DIM = 2560;
             let w = img.width;
             let h = img.height;
             if (w > MAX_DIM || h > MAX_DIM) {
