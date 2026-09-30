@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="lv" class="h-full bg-slate-950 text-white">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>PPR Mobilā Kamera</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+</head>
+<body class="h-full flex flex-col justify-between p-4 selection:bg-indigo-500/20 antialiased font-sans">
+
+  <header class="flex items-center justify-between pb-3 border-b border-slate-800">
+    <div class="flex items-center gap-2">
+      <div class="w-7 h-7 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-xs">📷</div>
+      <div>
+        <h1 class="text-xs font-bold tracking-tight">PPR Kameras Tilts</h1>
+        <p id="targetRoomText" class="text-[10px] text-slate-400 font-mono">Pieslēdzas...</p>
+      </div>
+    </div>
+    <div id="statusBadge" class="flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-900 border border-slate-800 text-[10px] font-semibold text-slate-400">
+      <span id="statusDot" class="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+      <span id="statusLabel">Savienojas...</span>
+    </div>
+  </header>
+
+  <main class="flex-1 flex flex-col items-center justify-center my-6 space-y-4 text-center">
+    <div class="w-20 h-20 rounded-3xl bg-slate-900 border border-slate-800 flex items-center justify-center text-3xl shadow-xl">
+      📄
+    </div>
+    <div class="space-y-1">
+      <h2 class="text-base font-bold text-slate-100">Fotografējiet pavadzīmi</h2>
+      <p class="text-xs text-slate-400 max-w-[260px]">Nofotografētais attēls automātiski ielidos tieši kases datora tabulā ar pilnu izšķirtspēju.</p>
+    </div>
+
+    <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-2xl bg-indigo-950/60 border border-indigo-500/30 text-xs text-indigo-300">
+      <span>Nosūtīti fotoattēli:</span>
+      <strong id="sentCount" class="font-mono text-white text-sm">0</strong>
+    </div>
+  </main>
+
+  <footer class="pb-4 space-y-3">
+    <input type="file" id="cameraInput" accept="image/*" capture="environment" class="hidden">
+
+    <button id="shutterBtn" onclick="triggerCamera()" disabled class="w-full py-4 rounded-2xl bg-indigo-600 active:bg-indigo-700 disabled:bg-slate-800 disabled:text-slate-600 text-white font-bold text-base shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2.5 transition">
+      <svg class="w-5 h-5 text-indigo-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      <span>Uzņemt pavadzīmes foto</span>
+    </button>
+  </footer>
+
+  <script>
+    let peer = null;
+    let conn = null;
+    let targetRoom = '';
+    let sentCounter = 0;
+
+    function getRoomFromUrl() {
+      const hash = window.location.hash || '';
+      const match = hash.match(/room=([^&]+)/);
+      return match ? match[1] : '';
+    }
+
+    function initClientPeer() {
+      targetRoom = getRoomFromUrl();
+      const roomText = document.getElementById('targetRoomText');
+      if (roomText) roomText.innerText = targetRoom ? `Istaba: ${targetRoom}` : 'Nav istabas koda!';
+
+      if (!targetRoom) {
+        setStatus(false, 'Nav QR koda');
+        alert('Trūkst savienojuma koda! Lūdzu, noskenējiet QR kodu no datora ekrāna vēlreiz.');
+        return;
+      }
+
+      peer = new Peer({ debug: 1 });
+
+      peer.on('open', () => {
+        conn = peer.connect(targetRoom, { reliable: true });
+
+        conn.on('open', () => {
+          setStatus(true, 'Savienots');
+          document.getElementById('shutterBtn').disabled = false;
+          if (navigator.vibrate) navigator.vibrate(80);
+        });
+
+        conn.on('data', (data) => {
+          if (data && data.type === 'PPR_ACK') {
+            sentCounter++;
+            document.getElementById('sentCount').innerText = sentCounter;
+            if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+          }
+        });
+
+        conn.on('close', () => {
+          setStatus(false, 'Atvienots');
+          document.getElementById('shutterBtn').disabled = true;
+        });
+      });
+
+      peer.on('error', (err) => {
+        console.warn('P2P Error', err);
+        setStatus(false, 'Kļūda');
+      });
+    }
+
+    function setStatus(connected, label) {
+      const dot = document.getElementById('statusDot');
+      const text = document.getElementById('statusLabel');
+      if (text) text.innerText = label;
+      if (dot) {
+        dot.className = connected ? "w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" : "w-1.5 h-1.5 rounded-full bg-amber-500";
+      }
+    }
+
+    function triggerCamera() {
+      document.getElementById('cameraInput').click();
+    }
+
+    document.getElementById('cameraInput').addEventListener('change', async (e) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+
+      const file = files[0];
+      const btn = document.getElementById('shutterBtn');
+      btn.disabled = true;
+      btn.innerText = "Sūta uz datoru...";
+
+      try {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64Data = reader.result.split(',')[1];
+          if (conn && conn.open) {
+            conn.send({
+              type: 'PPR_IMAGE',
+              name: file.name || `foto_${Date.now()}.jpg`,
+              data: base64Data
+            });
+          }
+          btn.disabled = false;
+          btn.innerText = "Uzņemt nākamo foto";
+        };
+        reader.readAsDataURL(file);
+      } catch (err) {
+        alert('Kļūda nosūtot attēlu: ' + err.message);
+        btn.disabled = false;
+        btn.innerText = "Mēģināt vēlreiz";
+      }
+
+      e.target.value = '';
+    });
+
+    window.addEventListener('DOMContentLoaded', initClientPeer);
+  </script>
+</body>
+</html>
